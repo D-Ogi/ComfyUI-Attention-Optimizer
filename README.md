@@ -91,7 +91,8 @@ pip install xformers
                         │ 1. Detect model params   │
                         │ 2. Check cache           │
                         │ 3. Benchmark (if needed) │
-                        │ 4. Apply fastest backend │
+                        │ 4. Clone model & apply   │
+                        │    attention override    │
                         └──────────────────────────┘
 ```
 
@@ -105,7 +106,7 @@ pip install xformers
 | `model` | MODEL | required | The diffusion model to optimize |
 | `attention_backend` | dropdown | `auto` | `auto` = benchmark & select best, or force specific backend |
 | `force_refresh` | bool | False | Re-run benchmark even if cached |
-| `auto_apply` | bool | True | Apply the selected backend globally |
+| `auto_apply` | bool | True | Apply the selected backend to this model |
 | `seq_len` | int | 8192 | Sequence length for benchmark |
 | `num_heads` | int | 24 | Number of attention heads |
 
@@ -113,7 +114,7 @@ pip install xformers
 
 | Output | Type | Description |
 |--------|------|-------------|
-| `model` | MODEL | Passthrough (unchanged) |
+| `model` | MODEL | Cloned model with optimized attention applied |
 | `best_attention` | STRING | Name of applied backend |
 | `kjnodes_mode` | STRING | Compatible mode for KJNodes PatchSageAttention |
 | `impl_type` | STRING | Implementation type (cuda/triton/pytorch) |
@@ -143,11 +144,11 @@ pip install xformers
 | SDXL | ✅ Full | head_dim=128, SageAttention optimal |
 | SD 1.5 | ✅ Full | head_dim=64 |
 | SD 3 | ✅ Full | |
-| Flux | ✅ Full | Patched at runtime |
-| LTX-V | ✅ Full | head_dim=160, uses module path (no patch needed) |
-| WAN 2.1/2.2 | ✅ Full | Patched at runtime |
-| Hunyuan Video | ✅ Full | Patched at runtime |
-| Cosmos | ✅ Full | Patched at runtime |
+| Flux | ✅ Full | Per-model attention override |
+| LTX-V | ✅ Full | head_dim=160 |
+| WAN 2.1/2.2 | ✅ Full | Per-model attention override |
+| Hunyuan Video | ✅ Full | Per-model attention override |
+| Cosmos | ✅ Full | Per-model attention override |
 | SeedVR2 | ❌ N/A | Uses own attention system, not affected |
 
 ## GPU Recommendations
