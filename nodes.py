@@ -271,13 +271,14 @@ def get_attention_function(backend):
                 out = flash_attn_func(q_t, k_t, v_t, dropout_p=0.0, causal=False)
                 return out.transpose(1, 2).contiguous()
             else:
-                b, n, d = q.shape
+                b, n_q, d = q.shape
                 d //= heads
-                q = q.view(b, n, heads, d)
-                k = k.view(b, n, heads, d)
-                v = v.view(b, n, heads, d)
+                n_k = k.shape[1]
+                q = q.view(b, n_q, heads, d)
+                k = k.view(b, n_k, heads, d)
+                v = v.view(b, n_k, heads, d)
                 out = flash_attn_func(q, k, v, dropout_p=0.0, causal=False)
-                return out.view(b, n, heads * d)
+                return out.view(b, n_q, heads * d)
         return flash_attn_wrapper
 
     # SageAttention variants - create wrapper functions
@@ -292,13 +293,14 @@ def get_attention_function(backend):
                 out = sageattn(q, k, v, is_causal=False, tensor_layout="NHD")
                 return out.permute(0, 2, 1, 3).contiguous()
             else:
-                b, n, d = q.shape
+                b, n_q, d = q.shape
                 d //= heads
-                q = q.view(b, n, heads, d)
-                k = k.view(b, n, heads, d)
-                v = v.view(b, n, heads, d)
+                n_k = k.shape[1]
+                q = q.view(b, n_q, heads, d)
+                k = k.view(b, n_k, heads, d)
+                v = v.view(b, n_k, heads, d)
                 out = sageattn(q, k, v, is_causal=False, tensor_layout="NHD")
-                return out.view(b, n, heads * d)
+                return out.view(b, n_q, heads * d)
         return sage_auto_attn
 
     elif backend == "sage_cuda":
@@ -312,13 +314,14 @@ def get_attention_function(backend):
                 out = sageattn_qk_int8_pv_fp16_cuda(q, k, v, is_causal=False, pv_accum_dtype="fp32", tensor_layout="NHD")
                 return out.permute(0, 2, 1, 3).contiguous()
             else:
-                b, n, d = q.shape
+                b, n_q, d = q.shape
                 d //= heads
-                q = q.view(b, n, heads, d)
-                k = k.view(b, n, heads, d)
-                v = v.view(b, n, heads, d)
+                n_k = k.shape[1]
+                q = q.view(b, n_q, heads, d)
+                k = k.view(b, n_k, heads, d)
+                v = v.view(b, n_k, heads, d)
                 out = sageattn_qk_int8_pv_fp16_cuda(q, k, v, is_causal=False, pv_accum_dtype="fp32", tensor_layout="NHD")
-                return out.view(b, n, heads * d)
+                return out.view(b, n_q, heads * d)
         return sage_cuda_attn
 
     elif backend == "sage_triton":
@@ -332,13 +335,14 @@ def get_attention_function(backend):
                 out = sageattn_qk_int8_pv_fp16_triton(q, k, v, is_causal=False, tensor_layout="NHD")
                 return out.permute(0, 2, 1, 3).contiguous()
             else:
-                b, n, d = q.shape
+                b, n_q, d = q.shape
                 d //= heads
-                q = q.view(b, n, heads, d)
-                k = k.view(b, n, heads, d)
-                v = v.view(b, n, heads, d)
+                n_k = k.shape[1]
+                q = q.view(b, n_q, heads, d)
+                k = k.view(b, n_k, heads, d)
+                v = v.view(b, n_k, heads, d)
                 out = sageattn_qk_int8_pv_fp16_triton(q, k, v, is_causal=False, tensor_layout="NHD")
-                return out.view(b, n, heads * d)
+                return out.view(b, n_q, heads * d)
         return sage_triton_attn
 
     elif backend == "sage_fp8_cuda":
@@ -352,13 +356,14 @@ def get_attention_function(backend):
                 out = sageattn_qk_int8_pv_fp8_cuda(q, k, v, is_causal=False, pv_accum_dtype="fp32+fp32", tensor_layout="NHD")
                 return out.permute(0, 2, 1, 3).contiguous()
             else:
-                b, n, d = q.shape
+                b, n_q, d = q.shape
                 d //= heads
-                q = q.view(b, n, heads, d)
-                k = k.view(b, n, heads, d)
-                v = v.view(b, n, heads, d)
+                n_k = k.shape[1]
+                q = q.view(b, n_q, heads, d)
+                k = k.view(b, n_k, heads, d)
+                v = v.view(b, n_k, heads, d)
                 out = sageattn_qk_int8_pv_fp8_cuda(q, k, v, is_causal=False, pv_accum_dtype="fp32+fp32", tensor_layout="NHD")
-                return out.view(b, n, heads * d)
+                return out.view(b, n_q, heads * d)
         return sage_fp8_attn
 
     elif backend == "sage_fp8_cuda_fast":
@@ -372,13 +377,14 @@ def get_attention_function(backend):
                 out = sageattn_qk_int8_pv_fp8_cuda(q, k, v, is_causal=False, pv_accum_dtype="fp32+fp16", tensor_layout="NHD")
                 return out.permute(0, 2, 1, 3).contiguous()
             else:
-                b, n, d = q.shape
+                b, n_q, d = q.shape
                 d //= heads
-                q = q.view(b, n, heads, d)
-                k = k.view(b, n, heads, d)
-                v = v.view(b, n, heads, d)
+                n_k = k.shape[1]
+                q = q.view(b, n_q, heads, d)
+                k = k.view(b, n_k, heads, d)
+                v = v.view(b, n_k, heads, d)
                 out = sageattn_qk_int8_pv_fp8_cuda(q, k, v, is_causal=False, pv_accum_dtype="fp32+fp16", tensor_layout="NHD")
-                return out.view(b, n, heads * d)
+                return out.view(b, n_q, heads * d)
         return sage_fp8_fast_attn
 
     elif backend == "sage3":
@@ -388,13 +394,14 @@ def get_attention_function(backend):
                 out = sageattn3_blackwell(q, k, v, is_causal=False)
                 return out
             else:
-                b, n, d = q.shape
+                b, n_q, d = q.shape
                 d //= heads
-                q = q.view(b, n, heads, d).permute(0, 2, 1, 3).contiguous()
-                k = k.view(b, n, heads, d).permute(0, 2, 1, 3).contiguous()
-                v = v.view(b, n, heads, d).permute(0, 2, 1, 3).contiguous()
+                n_k = k.shape[1]
+                q = q.view(b, n_q, heads, d).permute(0, 2, 1, 3).contiguous()
+                k = k.view(b, n_k, heads, d).permute(0, 2, 1, 3).contiguous()
+                v = v.view(b, n_k, heads, d).permute(0, 2, 1, 3).contiguous()
                 out = sageattn3_blackwell(q, k, v, is_causal=False)
-                return out.permute(0, 2, 1, 3).reshape(b, n, heads * d)
+                return out.permute(0, 2, 1, 3).reshape(b, n_q, heads * d)
         return sage3_attn
 
     return None
