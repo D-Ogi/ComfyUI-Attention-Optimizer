@@ -23,7 +23,6 @@ import time
 import torch
 from . import cache
 
-
 # ============================================================================
 # Backend availability checks
 # ============================================================================
@@ -93,8 +92,8 @@ def check_triton_available():
         return False, None
 
 
-def get_available_backends():
-    """Get list of all available attention backends."""
+def get_available_backends(skip_fp8_backends=False):
+    """Get list of all available attention backends with option to skip FP8 ones (they crash ComfyUI)."""
     backends = ["basic", "sub_quad", "split", "pytorch"]
 
     if check_xformers_available():
@@ -107,7 +106,7 @@ def get_available_backends():
         backends.append("sage_cuda")
     if check_sage_triton_available():
         backends.append("sage_triton")
-    if check_sage_fp8_available():
+    if not skip_fp8_backends and check_sage_fp8_available():
         backends.append("sage_fp8_cuda")
         backends.append("sage_fp8_cuda_fast")
 
@@ -242,22 +241,14 @@ def validate_backend(backend, q, k, v):
 
 
 # ============================================================================
-# Attention wrappers — used for benchmarking and as override functions.
-#
-# Each wrapper follows the ComfyUI optimized_attention signature:
-#   (q, k, v, heads, mask=None, skip_reshape=False, **kwargs)
-#
-# In the non-skip_reshape path we use view(b, -1, heads, dim_head) so that
-# each tensor infers its own sequence length via -1. This correctly handles
-# cross-attention where q has a different seq_len than k/v.
+# Benchmark functions
 # ============================================================================
 
 def get_attention_function(backend):
     """Get the attention function for a backend."""
-    from comfy.ldm.modules.attention import wrap_attn
     from comfy.ldm.modules import attention as comfy_attn
 
-    # Basic backends from ComfyUI — already have @wrap_attn
+    # Basic backends from ComfyUI
     if backend == "basic":
         return comfy_attn.attention_basic
     elif backend == "sub_quad":
@@ -270,202 +261,143 @@ def get_attention_function(backend):
         return comfy_attn.attention_xformers
     elif backend == "flash":
         from flash_attn import flash_attn_func
-
-        @wrap_attn
-        def flash_attn_wrapper(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+        def flash_attn_wrapper(q, k, v, heads, mask=None, skip_reshape=False, **kwargs):
             if skip_reshape:
+                # q: [b, h, n, d] -> [b, n, h, d] for flash_attn
                 q_t = q.transpose(1, 2).contiguous()
                 k_t = k.transpose(1, 2).contiguous()
                 v_t = v.transpose(1, 2).contiguous()
                 out = flash_attn_func(q_t, k_t, v_t, dropout_p=0.0, causal=False)
-                if skip_output_reshape:
-                    return out.transpose(1, 2)
                 return out.transpose(1, 2).contiguous()
             else:
-                b, _, dim_total = q.shape
-                dim_head = dim_total // heads
-                q = q.view(b, -1, heads, dim_head)
-                k = k.view(b, -1, heads, dim_head)
-                v = v.view(b, -1, heads, dim_head)
+                b, n, d = q.shape
+                d //= heads
+                q = q.view(b, n, heads, d)
+                k = k.view(b, n, heads, d)
+                v = v.view(b, n, heads, d)
                 out = flash_attn_func(q, k, v, dropout_p=0.0, causal=False)
-                if skip_output_reshape:
-                    return out.transpose(1, 2)
-                return out.reshape(b, -1, heads * dim_head)
+                return out.view(b, n, heads * d)
         return flash_attn_wrapper
 
-    # SageAttention variants
+    # SageAttention variants - create wrapper functions
     elif backend == "sage_auto":
         from sageattention import sageattn
-        sage_func = sageattn
-
-        @wrap_attn
-        def sage_auto_attn(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
-            in_dtype = v.dtype
-            if q.dtype == torch.float32 or k.dtype == torch.float32 or v.dtype == torch.float32:
-                q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
+        def sage_auto_attn(q, k, v, heads, mask=None, skip_reshape=False, **kwargs):
             if skip_reshape:
-                b, _, _, dim_head = q.shape
-                tensor_layout = "HND"
+                b, h, n, d = q.shape
+                q = q.permute(0, 2, 1, 3).contiguous()
+                k = k.permute(0, 2, 1, 3).contiguous()
+                v = v.permute(0, 2, 1, 3).contiguous()
+                out = sageattn(q, k, v, is_causal=False, tensor_layout="NHD")
+                return out.permute(0, 2, 1, 3).contiguous()
             else:
-                b, _, dim_total = q.shape
-                dim_head = dim_total // heads
-                q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
-                tensor_layout = "NHD"
-            out = sage_func(q, k, v, is_causal=False, tensor_layout=tensor_layout).to(in_dtype)
-            if tensor_layout == "HND":
-                if skip_output_reshape:
-                    return out
-                return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
-            else:
-                if skip_output_reshape:
-                    return out.transpose(1, 2)
-                return out.reshape(b, -1, heads * dim_head)
+                b, n, d = q.shape
+                d //= heads
+                q = q.view(b, n, heads, d)
+                k = k.view(b, n, heads, d)
+                v = v.view(b, n, heads, d)
+                out = sageattn(q, k, v, is_causal=False, tensor_layout="NHD")
+                return out.view(b, n, heads * d)
         return sage_auto_attn
 
     elif backend == "sage_cuda":
         from sageattention import sageattn_qk_int8_pv_fp16_cuda
-        sage_func = sageattn_qk_int8_pv_fp16_cuda
-
-        @wrap_attn
-        def sage_cuda_attn(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
-            in_dtype = v.dtype
-            if q.dtype == torch.float32 or k.dtype == torch.float32 or v.dtype == torch.float32:
-                q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
+        def sage_cuda_attn(q, k, v, heads, mask=None, skip_reshape=False, **kwargs):
             if skip_reshape:
-                b, _, _, dim_head = q.shape
-                tensor_layout = "HND"
+                b, h, n, d = q.shape
+                q = q.permute(0, 2, 1, 3).contiguous()
+                k = k.permute(0, 2, 1, 3).contiguous()
+                v = v.permute(0, 2, 1, 3).contiguous()
+                out = sageattn_qk_int8_pv_fp16_cuda(q, k, v, is_causal=False, pv_accum_dtype="fp32", tensor_layout="NHD")
+                return out.permute(0, 2, 1, 3).contiguous()
             else:
-                b, _, dim_total = q.shape
-                dim_head = dim_total // heads
-                q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
-                tensor_layout = "NHD"
-            out = sage_func(q, k, v, is_causal=False, pv_accum_dtype="fp32", tensor_layout=tensor_layout).to(in_dtype)
-            if tensor_layout == "HND":
-                if skip_output_reshape:
-                    return out
-                return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
-            else:
-                if skip_output_reshape:
-                    return out.transpose(1, 2)
-                return out.reshape(b, -1, heads * dim_head)
+                b, n, d = q.shape
+                d //= heads
+                q = q.view(b, n, heads, d)
+                k = k.view(b, n, heads, d)
+                v = v.view(b, n, heads, d)
+                out = sageattn_qk_int8_pv_fp16_cuda(q, k, v, is_causal=False, pv_accum_dtype="fp32", tensor_layout="NHD")
+                return out.view(b, n, heads * d)
         return sage_cuda_attn
 
     elif backend == "sage_triton":
         from sageattention import sageattn_qk_int8_pv_fp16_triton
-        sage_func = sageattn_qk_int8_pv_fp16_triton
-
-        @wrap_attn
-        def sage_triton_attn(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
-            in_dtype = v.dtype
-            if q.dtype == torch.float32 or k.dtype == torch.float32 or v.dtype == torch.float32:
-                q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
+        def sage_triton_attn(q, k, v, heads, mask=None, skip_reshape=False, **kwargs):
             if skip_reshape:
-                b, _, _, dim_head = q.shape
-                tensor_layout = "HND"
+                b, h, n, d = q.shape
+                q = q.permute(0, 2, 1, 3).contiguous()
+                k = k.permute(0, 2, 1, 3).contiguous()
+                v = v.permute(0, 2, 1, 3).contiguous()
+                out = sageattn_qk_int8_pv_fp16_triton(q, k, v, is_causal=False, tensor_layout="NHD")
+                return out.permute(0, 2, 1, 3).contiguous()
             else:
-                b, _, dim_total = q.shape
-                dim_head = dim_total // heads
-                q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
-                tensor_layout = "NHD"
-            out = sage_func(q, k, v, is_causal=False, tensor_layout=tensor_layout).to(in_dtype)
-            if tensor_layout == "HND":
-                if skip_output_reshape:
-                    return out
-                return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
-            else:
-                if skip_output_reshape:
-                    return out.transpose(1, 2)
-                return out.reshape(b, -1, heads * dim_head)
+                b, n, d = q.shape
+                d //= heads
+                q = q.view(b, n, heads, d)
+                k = k.view(b, n, heads, d)
+                v = v.view(b, n, heads, d)
+                out = sageattn_qk_int8_pv_fp16_triton(q, k, v, is_causal=False, tensor_layout="NHD")
+                return out.view(b, n, heads * d)
         return sage_triton_attn
 
     elif backend == "sage_fp8_cuda":
         from sageattention import sageattn_qk_int8_pv_fp8_cuda
-        sage_func = sageattn_qk_int8_pv_fp8_cuda
-
-        @wrap_attn
-        def sage_fp8_attn(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
-            in_dtype = v.dtype
-            if q.dtype == torch.float32 or k.dtype == torch.float32 or v.dtype == torch.float32:
-                q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
+        def sage_fp8_attn(q, k, v, heads, mask=None, skip_reshape=False, **kwargs):
             if skip_reshape:
-                b, _, _, dim_head = q.shape
-                tensor_layout = "HND"
+                b, h, n, d = q.shape
+                q = q.permute(0, 2, 1, 3).contiguous()
+                k = k.permute(0, 2, 1, 3).contiguous()
+                v = v.permute(0, 2, 1, 3).contiguous()
+                out = sageattn_qk_int8_pv_fp8_cuda(q, k, v, is_causal=False, pv_accum_dtype="fp32+fp32", tensor_layout="NHD")
+                return out.permute(0, 2, 1, 3).contiguous()
             else:
-                b, _, dim_total = q.shape
-                dim_head = dim_total // heads
-                q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
-                tensor_layout = "NHD"
-            out = sage_func(q, k, v, is_causal=False, pv_accum_dtype="fp32+fp32", tensor_layout=tensor_layout).to(in_dtype)
-            if tensor_layout == "HND":
-                if skip_output_reshape:
-                    return out
-                return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
-            else:
-                if skip_output_reshape:
-                    return out.transpose(1, 2)
-                return out.reshape(b, -1, heads * dim_head)
+                b, n, d = q.shape
+                d //= heads
+                q = q.view(b, n, heads, d)
+                k = k.view(b, n, heads, d)
+                v = v.view(b, n, heads, d)
+                out = sageattn_qk_int8_pv_fp8_cuda(q, k, v, is_causal=False, pv_accum_dtype="fp32+fp32", tensor_layout="NHD")
+                return out.view(b, n, heads * d)
         return sage_fp8_attn
 
     elif backend == "sage_fp8_cuda_fast":
         from sageattention import sageattn_qk_int8_pv_fp8_cuda
-        sage_func = sageattn_qk_int8_pv_fp8_cuda
-
-        @wrap_attn
-        def sage_fp8_fast_attn(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
-            in_dtype = v.dtype
-            if q.dtype == torch.float32 or k.dtype == torch.float32 or v.dtype == torch.float32:
-                q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
+        def sage_fp8_fast_attn(q, k, v, heads, mask=None, skip_reshape=False, **kwargs):
             if skip_reshape:
-                b, _, _, dim_head = q.shape
-                tensor_layout = "HND"
+                b, h, n, d = q.shape
+                q = q.permute(0, 2, 1, 3).contiguous()
+                k = k.permute(0, 2, 1, 3).contiguous()
+                v = v.permute(0, 2, 1, 3).contiguous()
+                out = sageattn_qk_int8_pv_fp8_cuda(q, k, v, is_causal=False, pv_accum_dtype="fp32+fp16", tensor_layout="NHD")
+                return out.permute(0, 2, 1, 3).contiguous()
             else:
-                b, _, dim_total = q.shape
-                dim_head = dim_total // heads
-                q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
-                tensor_layout = "NHD"
-            out = sage_func(q, k, v, is_causal=False, pv_accum_dtype="fp32+fp16", tensor_layout=tensor_layout).to(in_dtype)
-            if tensor_layout == "HND":
-                if skip_output_reshape:
-                    return out
-                return out.transpose(1, 2).reshape(b, -1, heads * dim_head)
-            else:
-                if skip_output_reshape:
-                    return out.transpose(1, 2)
-                return out.reshape(b, -1, heads * dim_head)
+                b, n, d = q.shape
+                d //= heads
+                q = q.view(b, n, heads, d)
+                k = k.view(b, n, heads, d)
+                v = v.view(b, n, heads, d)
+                out = sageattn_qk_int8_pv_fp8_cuda(q, k, v, is_causal=False, pv_accum_dtype="fp32+fp16", tensor_layout="NHD")
+                return out.view(b, n, heads * d)
         return sage_fp8_fast_attn
 
     elif backend == "sage3":
         from sageattn3 import sageattn3_blackwell
-
-        @wrap_attn
-        def sage3_attn(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
-            in_dtype = v.dtype
-            if q.dtype == torch.float32 or k.dtype == torch.float32 or v.dtype == torch.float32:
-                q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
+        def sage3_attn(q, k, v, heads, mask=None, skip_reshape=False, **kwargs):
             if skip_reshape:
-                out = sageattn3_blackwell(q, k, v, is_causal=False).to(in_dtype)
-                if skip_output_reshape:
-                    return out
-                b = out.shape[0]
-                return out.transpose(1, 2).reshape(b, -1, heads * q.shape[-1])
+                out = sageattn3_blackwell(q, k, v, is_causal=False)
+                return out
             else:
-                b, _, dim_total = q.shape
-                dim_head = dim_total // heads
-                q = q.view(b, -1, heads, dim_head).permute(0, 2, 1, 3).contiguous()
-                k = k.view(b, -1, heads, dim_head).permute(0, 2, 1, 3).contiguous()
-                v = v.view(b, -1, heads, dim_head).permute(0, 2, 1, 3).contiguous()
-                out = sageattn3_blackwell(q, k, v, is_causal=False).to(in_dtype)
-                if skip_output_reshape:
-                    return out
-                return out.permute(0, 2, 1, 3).reshape(b, -1, heads * dim_head)
+                b, n, d = q.shape
+                d //= heads
+                q = q.view(b, n, heads, d).permute(0, 2, 1, 3).contiguous()
+                k = k.view(b, n, heads, d).permute(0, 2, 1, 3).contiguous()
+                v = v.view(b, n, heads, d).permute(0, 2, 1, 3).contiguous()
+                out = sageattn3_blackwell(q, k, v, is_causal=False)
+                return out.permute(0, 2, 1, 3).reshape(b, n, heads * d)
         return sage3_attn
 
     return None
 
-
-# ============================================================================
-# Benchmark functions
-# ============================================================================
 
 def benchmark_backend(backend, q, k, v, heads, num_iterations=10):
     """Benchmark a specific backend."""
@@ -505,7 +437,7 @@ def benchmark_backend(backend, q, k, v, heads, num_iterations=10):
         sys.stderr = old_stderr
 
 
-def run_benchmark(head_dim=128, seq_len=4096, num_heads=24, batch_size=1):
+def run_benchmark(head_dim=128, seq_len=4096, num_heads=24, batch_size=1, skip_fp8_backends=False):
     """Run benchmark for all available backends."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16
@@ -515,7 +447,7 @@ def run_benchmark(head_dim=128, seq_len=4096, num_heads=24, batch_size=1):
     v = torch.randn(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
 
     results = {}
-    available = get_available_backends()
+    available = get_available_backends(skip_fp8_backends=skip_fp8_backends)
 
     # All possible backends in order
     all_backends = [
@@ -614,18 +546,38 @@ def run_benchmark(head_dim=128, seq_len=4096, num_heads=24, batch_size=1):
     return results
 
 
-def apply_backend(backend, model):
-    """Apply attention backend via model's optimized_attention_override (per-model, reversible)."""
+def apply_backend(backend):
+    """Apply attention backend globally, including to already-imported modules."""
     try:
+        import sys
+        import comfy.ldm.modules.attention as attn_module
+
         attn_func = get_attention_function(backend)
         if not attn_func:
             return False
 
-        def attention_override(func, *args, **kwargs):
-            return attn_func.__wrapped__(*args, **kwargs)
+        # Update the main attention module
+        attn_module.optimized_attention = attn_func
+        attn_module.optimized_attention_masked = attn_func
 
-        model.model_options["transformer_options"]["optimized_attention_override"] = attention_override
-        print(f"[Benchmark] Applied via optimized_attention_override: {backend}")
+        # Patch all modules that imported optimized_attention directly
+        modules_to_patch = [
+            "comfy.ldm.wan.model",
+            "comfy.ldm.wan.model_animate",
+            "comfy.ldm.wan.model_multitalk",
+            "comfy.ldm.flux.model",
+            "comfy.ldm.hunyuan_video.model",
+            "comfy.ldm.lightricks.model",
+            "comfy.ldm.cosmos.model",
+        ]
+
+        for mod_name in modules_to_patch:
+            if mod_name in sys.modules:
+                mod = sys.modules[mod_name]
+                if hasattr(mod, "optimized_attention"):
+                    mod.optimized_attention = attn_func
+                    print(f"[Benchmark] Patched {mod_name}")
+
         return True
     except Exception as e:
         print(f"[Benchmark] apply_backend error: {e}")
@@ -704,7 +656,7 @@ class BenchmarkAndOptimize:
     - report: Full text report
     """
 
-    # All possible backends for dropdown
+    # The backends in 2 lists, so that the FP8 ones can be skipped
     ALL_BACKENDS = [
         "auto",  # Run benchmark and pick best
         "pytorch",
@@ -712,23 +664,27 @@ class BenchmarkAndOptimize:
         "sage_auto",
         "sage_cuda",
         "sage_triton",
-        "sage_fp8_cuda",
-        "sage_fp8_cuda_fast",
         "sage3",
         "flash",
         "basic",
         "sub_quad",
         "split",
+        "sage_fp8_cuda",
+        "sage_fp8_cuda_fast",
     ]
 
     @classmethod
     def INPUT_TYPES(cls):
+        # Check if the GPU supports FP8 before setting any values in the node
+        IS_PLEB = cls._is_pleb(cls)
+        print(f"[Benchmark] GPU {'does not support' if IS_PLEB else 'supports'} native FP8, will {'skip' if IS_PLEB else 'include'} FP8 backends in benchmark.")
         return {
             "required": {
                 "model": ("MODEL",),
             },
             "optional": {
                 "attention_backend": (cls.ALL_BACKENDS, {"default": "auto"}),
+                "skip_fp8_backends": ("BOOLEAN", {"default": IS_PLEB}),
                 "force_refresh": ("BOOLEAN", {"default": False}),
                 "auto_apply": ("BOOLEAN", {"default": True}),
                 "seq_len": ("INT", {"default": 8192, "min": 256, "max": 32768}),
@@ -741,23 +697,21 @@ class BenchmarkAndOptimize:
     FUNCTION = "benchmark"
     CATEGORY = "model_patches/optimization"
 
-    def benchmark(self, model, attention_backend="auto", force_refresh=False, auto_apply=True, seq_len=4096, num_heads=24):
+
+    def benchmark(self, model, attention_backend="auto", skip_fp8_backends=False, force_refresh=False, auto_apply=True, seq_len=4096, num_heads=24):
         model_hash = cache.get_model_hash(model)
         model_dtype = cache.get_model_dtype(model)
         head_dim = cache.get_head_dim(model)
 
-        # Clone model so we set override on the clone
-        model_clone = model.clone()
-
         # Force specific backend (skip benchmark)
         if attention_backend != "auto":
-            available = get_available_backends()
+            available = get_available_backends(skip_fp8_backends=skip_fp8_backends)
             if attention_backend not in available:
                 print(f"[Benchmark] WARNING: {attention_backend} not available, falling back to pytorch")
                 attention_backend = "pytorch"
 
             if auto_apply:
-                if apply_backend(attention_backend, model_clone):
+                if apply_backend(attention_backend):
                     print(f"[Benchmark] Force applied: {attention_backend}")
                 else:
                     print(f"[Benchmark] Failed to apply {attention_backend}")
@@ -767,7 +721,7 @@ class BenchmarkAndOptimize:
             report = f"Force selected: {attention_backend}\nNo benchmark run."
 
             return (
-                model_clone,
+                model,
                 attention_backend,
                 kjmode,
                 impl,
@@ -785,14 +739,14 @@ class BenchmarkAndOptimize:
             if cached:
                 best = cached.get("_best", "pytorch")
                 if auto_apply:
-                    apply_backend(best, model_clone)
+                    apply_backend(best)
                     print(f"[Benchmark] Applied cached: {best}")
 
                 kjmode = backend_to_kjnodes_mode(best)
                 impl = get_impl_type(best)
                 report = self._build_report(cached, head_dim, seq_len, model_dtype, from_cache=True)
                 return (
-                    model_clone,
+                    model,
                     best,
                     kjmode,
                     impl,
@@ -804,12 +758,13 @@ class BenchmarkAndOptimize:
 
         # Run benchmark
         print(f"[Benchmark] Running... (head_dim={head_dim}, seq_len={seq_len})")
-        print(f"[Benchmark] Available: {get_available_backends()}")
+        print(f"[Benchmark] Available: {get_available_backends(skip_fp8_backends=skip_fp8_backends)}")
 
         results = run_benchmark(
             head_dim=head_dim,
             seq_len=seq_len,
-            num_heads=num_heads
+            num_heads=num_heads,
+            skip_fp8_backends=skip_fp8_backends
         )
 
         # Save to cache
@@ -818,17 +773,17 @@ class BenchmarkAndOptimize:
         # Apply best
         best = results["_best"]
         if auto_apply:
-            if apply_backend(best, model_clone):
+            if apply_backend(best):
                 print(f"[Benchmark] Applied: {best} ({results['_best_speedup']}x)")
             else:
                 print(f"[Benchmark] Failed to apply {best}")
 
         kjmode = backend_to_kjnodes_mode(best)
         impl = get_impl_type(best)
-        report = self._build_report(results, head_dim, seq_len, model_dtype, from_cache=False)
+        report = self._build_report(results, head_dim, seq_len, model_dtype, from_cache=False, skip_fp8_backends=skip_fp8_backends)
 
         return (
-            model_clone,
+            model,
             best,
             kjmode,
             impl,
@@ -838,7 +793,17 @@ class BenchmarkAndOptimize:
             report
         )
 
-    def _build_report(self, data, head_dim, seq_len, dtype, from_cache=False):
+    def _is_pleb(self):
+        """Checks if the GPU doesn't support FP8 (will crash the node)."""
+        if not torch.cuda.is_available():
+            return True
+        # FP8 is supported natively on those with compute capability >= 8.9
+        # Currently 8.9, 9.0 and 10.0 I think?
+        # 8.0 and 8.6 can go fuck themselves
+        major, minor = torch.cuda.get_device_capability()
+        return not (major > 8 or (major == 8 and minor >= 9))
+
+    def _build_report(self, data, head_dim, seq_len, dtype, from_cache=False, skip_fp8_backends=False):
         lines = [
             "=" * 65,
             "BENCHMARK REPORT" + (" (cached)" if from_cache else ""),
@@ -857,6 +822,7 @@ class BenchmarkAndOptimize:
         if info.get("sage_version"):
             lines.append(f"SageAttention: v{info['sage_version']}")
 
+        lines.append(f" | Native FP8 Backends Included: " + ("NO" if skip_fp8_backends else "YES"))
         lines.append("")
         best_backend = data.get('_best', '?')
         kjmode = backend_to_kjnodes_mode(best_backend)

@@ -105,6 +105,7 @@ pip install xformers
 |-------|------|---------|-------------|
 | `model` | MODEL | required | The diffusion model to optimize |
 | `attention_backend` | dropdown | `auto` | `auto` = benchmark & select best, or force specific backend |
+| `skip_fp8_backends` | bool | * | Is set automatically based on GPU. **Don't change unless you know exactly what you're doing**  |
 | `force_refresh` | bool | False | Re-run benchmark even if cached |
 | `auto_apply` | bool | True | Apply the selected backend to this model |
 | `seq_len` | int | 8192 | Sequence length for benchmark |
@@ -236,6 +237,11 @@ pip install xformers       # for xformers
 
 ### Model not affected
 Some models (like SeedVR2) use their own attention implementation and won't be affected by this plugin. Check the compatibility table above.
+
+### Comfy crashes and burns as soon as I try to run the node
+1. Make sure the crash is caused by the benchmark node (remove it and re-run the workflow)
+2. You deactivated the `skip_fp8_backends` switch didn't you? Activate it again and restart ComfyUI. Native FP8 backends **must** be skipped **completely** from the benchmark on unsupported GPUs (any RTX below the 4000 series) to prevent crashes.
+
 
 ## License
 
