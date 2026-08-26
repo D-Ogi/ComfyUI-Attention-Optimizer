@@ -3,7 +3,7 @@ ComfyUI Attention Optimizer
 
 Automatically benchmark and optimize the attention mechanism in diffusion models.
 Attention is the most expensive operation in transformer-based models (40-70% of generation time).
-This plugin benchmarks all available backends (SDPA, Flash Attention, SageAttention, xFormers)
+This plugin benchmarks all available backends (SDPA, Flash Attention, SageAttention, xFormers, Comfy Kitchen)
 and applies the fastest one for your GPU.
 
 Nodes:

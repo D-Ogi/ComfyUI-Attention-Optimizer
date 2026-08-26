@@ -2,6 +2,24 @@
 
 **Automatically benchmark and optimize the attention mechanism in diffusion models for maximum generation speed.**
 
+## Changelog
+
+### 1.0.2
+- **Add Comfy Kitchen (ck) attention backend** — detection, validation, and per-model apply via `set_model_optimized_attention()` with `container_function` support (ComfyUI PR #15479, `comfy-kitchen>=0.2.30`).
+- **Statistical benchmarking methodology** (ported from `diag_nvfp4_extended.py`):
+  - per-iteration CUDA event timing → `mean ± σ`, `p50`, `p95`
+  - TFLOPS reporting per backend
+  - exact exception capture for fallback root-causing
+  - optional M-scaling sweep across sequence lengths (`seq_sweep`: `off`/`quick`/`full`)
+  - JSON export via `json_path` input
+- New node inputs: `timing_iters`, `timing_warmup`, `seq_sweep`, `json_path`.
+
+### v1.0.1
+- Fix cross-attention crash and use per-model attention override (#3).
+
+### v1.0.0
+- Initial release.
+
 ## Why This Matters
 
 ### The Problem
@@ -109,6 +127,10 @@ pip install xformers
 | `auto_apply` | bool | True | Apply the selected backend to this model |
 | `seq_len` | int | 8192 | Sequence length for benchmark |
 | `num_heads` | int | 24 | Number of attention heads |
+| `timing_iters` | int | 30 | Timing iterations per backend (mean/std/p50/p95 via CUDA events) |
+| `timing_warmup` | int | 10 | Warmup iterations per backend |
+| `seq_sweep` | dropdown | `off` | M-scaling sweep: `off`, `quick` (seq/2, seq\*2), `full` (grid 256..16384) |
+| `json_path` | str | "" | Optional path to export full benchmark results as JSON |
 
 ### Node Outputs
 
@@ -136,6 +158,7 @@ pip install xformers
 | `sage_fp8_cuda_fast` | SageAttention FP8++ | Even faster FP8 |
 | `sage3` | SageAttention 3 | RTX 50xx (Blackwell) only |
 | `flash` | Flash Attention 2 | H100, A100, RTX 30xx/40xx |
+| `ck` | Comfy Kitchen int8 | CUDA, requires ComfyUI PR #15479 / `comfy-kitchen>=0.2.30` |
 
 ## Model Compatibility
 
